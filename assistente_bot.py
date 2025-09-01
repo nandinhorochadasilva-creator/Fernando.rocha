@@ -1,6 +1,7 @@
 import asyncio
 import subprocess
 import os
+import shutil
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -9,13 +10,12 @@ TOKEN = "8213294688:AAFvDn749s5K2sZ8xDBvMwomdPdLp66Vc3c"
 CHAT_ID = "7408514634"
 
 # --- FUNÇÕES DE COMANDO ---
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     await update.message.reply_html(
         f"Olá, {user.mention_html()}! Comandos disponíveis:\n"
         f"/status - Mostra o painel de controle.\n"
-        f"/scan &lt;url&gt; - Inicia uma varredura de vulnerabilidades."
+        f"/scan &lt;url&gt; - Inicia uma varredura e envia o relatório."
     )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -33,7 +33,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         print(f"Erro ao executar painel.sh: {e}")
 
 # --- LÓGICA PARA TAREFAS EM SEGUNDO PLANO ---
-
 async def run_scan_task(update: Update, context: ContextTypes.DEFAULT_TYPE, target_url: str):
     chat_id = update.effective_chat.id
     print(f"Iniciando scan para {target_url} para o chat {chat_id}")
@@ -47,21 +46,57 @@ async def run_scan_task(update: Update, context: ContextTypes.DEFAULT_TYPE, targ
     report_folder_name = "relatorio_" + domain_part.replace('/', '_').replace(':', '_')
     report_path = os.path.join(os.path.expanduser("~"), report_folder_name)
     
-    command = ["wapiti", "-u", sanitized_url, "-o", report_path, "--scope", "domain"]
+    command = ["wapiti", "-u", sanitized_url, "-f", "json", "-o", report_path, "--scope", "domain"]
 
-    process = await asyncio.create_subprocess_exec(
-        *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
 
-    stdout, stderr = await process.communicate()
+        stdout, stderr = await process.communicate()
 
-    if process.returncode == 0:
-        final_message = f"✅ Varredura de '{sanitized_url}' concluída!\n\nRelatório salvo em: {report_folder_name}"
-    else:
-        final_message = f"❌ A varredura de '{sanitized_url}' falhou.\n\nErro:\n{stderr.decode()}"
+        if process.returncode == 0:
+            try:
+                report_file = None
+                if os.path.isdir(report_path):
+                    for file in os.listdir(report_path):
+                        if file.endswith(".json"):
+                            report_file = os.path.join(report_path, file)
+                            break
+                
+                if report_file:
+                    await context.bot.send_message(
+                        chat_id=chat_id, 
+                        text=f"✅ Varredura de '{sanitized_url}' concluída! Enviando relatório..."
+                    )
+                    await context.bot.send_document(
+                        chat_id=chat_id, 
+                        document=open(report_file, 'rb'),
+                        filename=f"wapiti_report_{domain_part}.json"
+                    )
+                else:
+                    await context.bot.send_message(chat_id=chat_id, text=f"Varredura de '{sanitized_url}' terminou, mas não foi possível encontrar o arquivo de relatório JSON.")
+
+            except Exception as e:
+                await context.bot.send_message(chat_id=chat_id, text=f"Ocorreu um erro ao processar o relatório: {e}")
+                print(f"Erro ao processar relatório: {e}")
+        else:
+            error_log = stderr.decode() if stderr else "Nenhuma saída de erro."
+            final_message = f"❌ A varredura de '{sanitized_url}' falhou.\n\n**Log de Erro do Wapiti:**\n`{error_log}`"
+            await context.bot.send_message(chat_id=chat_id, text=final_message, parse_mode="Markdown")
     
-    await context.bot.send_message(chat_id=chat_id, text=final_message)
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"Ocorreu um erro crítico ao tentar executar o Wapiti: {e}")
+        print(f"Erro crítico em run_scan_task: {e}")
+        
+    finally:
+        # Lógica de limpeza segura
+        if os.path.isdir(report_path):
+            shutil.rmtree(report_path)
+            print(f"Pasta de relatório {report_folder_name} foi limpa.")
+
     print(f"Scan para {sanitized_url} concluído.")
+
 
 async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
@@ -71,12 +106,11 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     target_url = context.args[0]
     await update.message.reply_text(
         f"Entendido! 🚀\nIniciando varredura em {target_url}.\n"
-        f"Este processo pode levar horas. Avisarei quando terminar."
+        f"Este processo pode levar horas. No final, enviarei o arquivo do relatório."
     )
     asyncio.create_task(run_scan_task(update, context, target_url))
 
 # --- FUNÇÃO PRINCIPAL ---
-
 def main() -> None:
     print("Iniciando o bot...")
     application = Application.builder().token(TOKEN).build()
@@ -90,3 +124,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
